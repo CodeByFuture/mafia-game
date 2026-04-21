@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback, useRef, useEffect } from 'react';
+import { createContext, useContext, useReducer, useCallback, useRef } from 'react';
 import * as Ably from 'ably';
 import {
   assignRoles, checkWinCondition, resolveNight, resolveVotes,
@@ -6,18 +6,6 @@ import {
 } from '../engine';
 
 const GameContext = createContext(null);
-
-// ── Persist session to localStorage so reconnect works ──────────
-const SESSION_KEY = 'mafia_session';
-function saveSession(data) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(data)); } catch {}
-}
-function loadSession() {
-  try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch { return null; }
-}
-function clearSession() {
-  try { localStorage.removeItem(SESSION_KEY); } catch {}
-}
 
 const initialState = {
   screen: 'home',
@@ -59,9 +47,8 @@ const initialState = {
   error: null,
   isSpectator: false,
   rolesInGame: [],
-  transitioning: false, // for animations
-  transitionType: null, // 'to_night' | 'to_day'
-  reconnecting: false,
+  transitioning: false,
+  transitionType: null,
 };
 
 function reducer(state, action) {
@@ -77,6 +64,7 @@ function reducer(state, action) {
   }
 }
 
+// Single shared Ably client
 let ablyClient = null;
 function getClient() {
   if (!ablyClient) {
@@ -97,33 +85,13 @@ export function GameProvider({ children }) {
   const votesStore = useRef({});
   const voteTimerRef = useRef(null);
   const lastWillsStore = useRef({});
-  const gameStateSnapshot = useRef(null); // full snapshot for reconnect
 
-  // ── Check for existing session on load ───────────────────────
-  useEffect(() => {
-    const session = loadSession();
-    if (session?.roomCode && session?.playerId) {
-      dispatch({ type: 'PATCH', payload: { reconnecting: true } });
-      reconnectToRoom(session);
-    }
-  }, []);
-
-  // ── Save session on important state changes ───────────────────
-  useEffect(() => {
-    const s = stateRef.current;
-    if (s.playerId && s.roomCode && s.screen !== 'home') {
-      saveSession({
-        playerId: s.playerId, playerName: s.playerName,
-        playerAvatar: s.playerAvatar, roomCode: s.roomCode,
-        isSpectator: s.isSpectator,
-      });
-    }
-  }, [state.screen, state.roomCode, state.playerId]);
-
+  // ── Publish to room channel ───────────────────────────────────
   const pub = useCallback((msg) => {
     channelRef.current?.publish('game', msg);
   }, []);
 
+  // ── Publish to a player's private channel ─────────────────────
   const pubPrivate = useCallback((targetPlayerId, msg) => {
     const client = getClient();
     if (!client) return;
@@ -131,7 +99,7 @@ export function GameProvider({ children }) {
       .publish('private', msg);
   }, []);
 
-  // ── Transition helper (animates between phases) ───────────────
+  // ── Animated transition between phases ───────────────────────
   const transitionTo = useCallback((screen, type, payload) => {
     dispatch({ type: 'PATCH', payload: { transitioning: true, transitionType: type } });
     setTimeout(() => {
@@ -139,163 +107,95 @@ export function GameProvider({ children }) {
     }, 600);
   }, []);
 
+  // ── Connect to Ably room channel ──────────────────────────────
   const connectToRoom = useCallback((roomCode, playerId) => {
     const client = getClient();
-    if (!client) { dispatch({ type: 'SET_ERROR', error: 'Ably not configured.' }); return; }
+    if (!client) {
+      dispatch({ type: 'SET_ERROR', error: 'Connection failed. Check your internet.' });
+      return;
+    }
+
+    // Public channel — all players subscribe
     const ch = client.channels.get(`mafia-room-${roomCode}`);
     channelRef.current = ch;
-    ch.subscribe((msg) => handlePublicMessage(msg.data));
-    const priv = client.channels.get(`mafia-private-${roomCode}-${playerId}`);
-    priv.subscribe((msg) => handlePrivateMessage(msg.data));
+    ch.subscribe((msg) => handleMsg(msg.data));
 
-    // Listen for host heartbeat — detect if host disconnected
-    const heartbeatCh = client.channels.get(`mafia-heartbeat-${roomCode}`);
-    heartbeatCh.subscribe((msg) => {
-      if (msg.data?.type === 'HOST_LEFT') handleHostLeft();
-      if (msg.data?.type === 'HOST_SNAPSHOT') {
-        gameStateSnapshot.current = msg.data.snapshot;
-        // If reconnecting, restore state
-        const s = stateRef.current;
-        if (s.reconnecting) {
-          const snap = msg.data.snapshot;
-          dispatch({ type: 'PATCH', payload: {
-            reconnecting: false, players: snap.players,
-            settings: snap.settings, phase: snap.phase,
-            round: snap.round, eliminatedPlayers: snap.eliminatedPlayers || [],
-            gameLog: snap.gameLog || [], hostId: snap.hostId,
-            rolesInGame: snap.rolesInGame || [],
-            screen: snap.phase === 'lobby' ? 'lobby' : snap.phase === 'ended' ? 'ended' :
-                    s.isSpectator ? 'spectate' : snap.phase === 'night' ? 'night' : 'day',
-          }});
-        }
-      }
-    });
-  }, []);
+    // Private channel — only this player subscribes
+    client.channels.get(`mafia-private-${roomCode}-${playerId}`)
+      .subscribe((msg) => handlePrivate(msg.data));
 
-  function reconnectToRoom(session) {
-    const { playerId, playerName, playerAvatar, roomCode, isSpectator } = session;
-    dispatch({ type: 'PATCH', payload: {
-      playerId, playerName, playerAvatar, roomCode, isSpectator,
-      screen: 'reconnecting',
-    }});
-    connectToRoom(roomCode, playerId);
-    // Ask for snapshot
-    setTimeout(() => {
-      const ch = channelRef.current;
-      ch?.publish('game', { type: 'REQUEST_SNAPSHOT', playerId });
-    }, 1000);
-    // Timeout if no response
-    setTimeout(() => {
-      if (stateRef.current.reconnecting) {
-        clearSession();
-        dispatch({ type: 'RESET' });
-        dispatch({ type: 'SET_ERROR', error: 'Could not reconnect — room may have ended.' });
-      }
-    }, 8000);
-  }
+  }, []); // eslint-disable-line
 
-  function handleHostLeft() {
+  // ── Handle public messages ────────────────────────────────────
+  function handleMsg(data) {
     const s = stateRef.current;
-    if (s.phase === 'lobby' || s.phase === 'ended') return;
 
-    // Find next player to be host (first alive non-host player)
-    const nextHost = s.players.find(p => p.id !== s.hostId && p.alive);
-    if (!nextHost) return;
-
-    // If WE are the next host, take over
-    if (nextHost.id === s.playerId) {
-      dispatch({ type: 'PATCH', payload: { hostId: s.playerId } });
-      pub({ type: 'HOST_MIGRATED', newHostId: s.playerId, newHostName: s.playerName });
-      // Republish snapshot so others can update
-      publishSnapshot();
-    }
-  }
-
-  function publishSnapshot() {
-    const s = stateRef.current;
-    const client = getClient();
-    if (!client) return;
-    const ch = client.channels.get(`mafia-heartbeat-${s.roomCode}`);
-    ch.publish('heartbeat', {
-      type: 'HOST_SNAPSHOT',
-      snapshot: {
-        players: s.players, settings: s.settings,
-        phase: s.phase, round: s.round,
-        eliminatedPlayers: s.eliminatedPlayers,
-        gameLog: s.gameLog, hostId: s.playerId,
-        rolesInGame: s.rolesInGame,
-      }
-    });
-  }
-
-  function handlePublicMessage(data) {
-    const s = stateRef.current;
     switch (data.type) {
 
-      case 'REQUEST_SNAPSHOT':
-        if (s.playerId === s.hostId) {
-          publishSnapshot();
-          // Also send players sync on main channel immediately
-          pub({ type: 'PLAYERS_SYNC', players: s.players, hostId: s.playerId, settings: s.settings });
-        }
-        break;
-
-      case 'HOST_MIGRATED':
-        dispatch({ type: 'PATCH', payload: { hostId: data.newHostId } });
-        break;
-
+      // ── Lobby ──────────────────────────────────────────────────
       case 'PLAYER_JOINED': {
-        // Password check
-        if (s.settings?.password && data.password !== s.settings.password && data.player.id !== s.playerId) {
-          if (s.playerId === s.hostId) {
-            pub({ type: 'PLAYER_KICKED', playerId: data.player.id, reason: 'wrong_password' });
+        // Password enforcement
+        if (s.hostId === s.playerId && s.settings?.password) {
+          if (data.password !== s.settings.password && data.player.id !== s.playerId) {
+            pub({ type: 'KICKED', playerId: data.player.id, reason: 'Wrong password.' });
+            return;
           }
-          return;
         }
-        const alreadyExists = s.players.find(p => p.id === data.player.id);
-        const newPlayers = alreadyExists ? s.players : [...s.players, data.player];
-        dispatch({ type: 'PATCH', payload: { players: newPlayers } });
-        // Host broadcasts full player list so everyone syncs
-        if (s.playerId === s.hostId) {
-          setTimeout(() => {
-            pub({ type: 'PLAYERS_SYNC', players: stateRef.current.players, hostId: stateRef.current.playerId, settings: stateRef.current.settings });
-          }, 300);
+        // Add player if not already in list
+        if (!s.players.find(p => p.id === data.player.id)) {
+          const newPlayers = [...s.players, data.player];
+          dispatch({ type: 'PATCH', payload: { players: newPlayers } });
+          // Host sends full sync back so new joiner gets everyone
+          if (s.playerId === s.hostId) {
+            setTimeout(() => {
+              pub({
+                type: 'ROOM_SYNC',
+                players: stateRef.current.players,
+                hostId: stateRef.current.hostId,
+                settings: stateRef.current.settings,
+              });
+            }, 200);
+          }
         }
         break;
       }
 
-      case 'SPECTATOR_JOINED':
-        if (!s.spectators.find(p => p.id === data.player.id))
-          dispatch({ type: 'PATCH', payload: { spectators: [...s.spectators, data.player] } });
-        break;
-
-      case 'PLAYERS_SYNC':
-        // Full player list from host — sync everyone
+      case 'ROOM_SYNC': {
+        // Full state sync from host — update players, host, settings
         dispatch({ type: 'PATCH', payload: {
           players: data.players,
           hostId: data.hostId,
           settings: data.settings,
         }});
         break;
+      }
 
-      case 'PLAYER_KICKED':
+      case 'SPECTATOR_JOINED': {
+        if (!s.spectators.find(p => p.id === data.player.id))
+          dispatch({ type: 'PATCH', payload: { spectators: [...s.spectators, data.player] } });
+        break;
+      }
+
+      case 'KICKED': {
         if (data.playerId === s.playerId) {
-          clearSession();
           dispatch({ type: 'RESET' });
-          dispatch({ type: 'SET_ERROR', error: data.reason === 'wrong_password' ? 'Wrong room password.' : 'You were kicked by the host.' });
+          dispatch({ type: 'SET_ERROR', error: data.reason || 'You were kicked.' });
         } else {
           dispatch({ type: 'PATCH', payload: { players: s.players.filter(p => p.id !== data.playerId) } });
         }
         break;
+      }
 
       case 'SETTINGS_UPDATED':
         dispatch({ type: 'PATCH', payload: { settings: data.settings } });
         break;
 
+      // ── Game start ─────────────────────────────────────────────
       case 'GAME_STARTED':
         dispatch({ type: 'PATCH', payload: { rolesInGame: data.rolesInGame || [] } });
         break;
 
+      // ── Night ──────────────────────────────────────────────────
       case 'NIGHT_START':
         transitionTo(
           s.isSpectator ? 'spectate' : 'night',
@@ -304,14 +204,17 @@ export function GameProvider({ children }) {
         );
         break;
 
+      // ── Day ────────────────────────────────────────────────────
       case 'DAY_START':
         transitionTo(
           s.isSpectator ? 'spectate' : 'day',
           'to_day',
           {
-            phase: 'day', nightLog: data.nightLog, players: data.players,
-            eliminatedPlayers: data.eliminatedPlayers, gameLog: data.gameLog, votes: {},
-            voteTimerActive: data.voteTimerSeconds > 0, voteTimerSeconds: data.voteTimerSeconds,
+            phase: 'day', nightLog: data.nightLog,
+            players: data.players, eliminatedPlayers: data.eliminatedPlayers,
+            gameLog: data.gameLog, votes: {},
+            voteTimerActive: data.voteTimerSeconds > 0,
+            voteTimerSeconds: data.voteTimerSeconds,
             lastWills: { ...s.lastWills, ...data.revealedWills },
           }
         );
@@ -329,8 +232,8 @@ export function GameProvider({ children }) {
         }});
         break;
 
+      // ── End ────────────────────────────────────────────────────
       case 'GAME_ENDED':
-        clearSession();
         dispatch({ type: 'PATCH', payload: {
           screen: 'ended', phase: 'ended',
           winner: data.winner, jesterWinner: data.jesterWinner,
@@ -350,45 +253,53 @@ export function GameProvider({ children }) {
       case 'GAME_RESTARTED':
         dispatch({ type: 'PATCH', payload: {
           screen: 'lobby', phase: 'lobby', round: 0,
-          players: data.players, settings: data.settings,
+          players: data.players, settings: data.settings, hostId: data.hostId,
           eliminatedPlayers: [], gameLog: [], nightLog: [],
           mafiaChat: [], deadChat: [], winner: null, jesterWinner: null,
           myRole: null, mafiaTeam: [], nightAction: null,
           actionConfirmed: false, detectiveResult: null,
           mvpVotes: {}, mvpResult: null, lastWills: {}, myLastWill: '',
-          rolesInGame: [], hostId: data.hostId || s.hostId,
+          rolesInGame: [],
         }});
         break;
 
+      // ── Chat ───────────────────────────────────────────────────
       case 'MAFIA_CHAT_MSG':
-        if (isMafiaRole(s.myRole)) dispatch({ type: 'ADD_MAFIA_CHAT', msg: data });
+        if (isMafiaRole(s.myRole))
+          dispatch({ type: 'ADD_MAFIA_CHAT', msg: data });
         break;
 
       case 'DEAD_CHAT_MSG': {
         const me = s.players.find(p => p.id === s.playerId);
-        if (me && !me.alive) dispatch({ type: 'ADD_DEAD_CHAT', msg: data });
+        if (me && !me.alive)
+          dispatch({ type: 'ADD_DEAD_CHAT', msg: data });
         break;
       }
-
-      case 'NIGHT_ACTIONS_RECEIVED':
-        if (s.playerId === s.hostId) handleNightActionsAsHost(data.nightActions, data.round);
-        break;
-
-      case 'VOTES_RECEIVED':
-        if (s.playerId === s.hostId) handleVotesAsHost(data.votes, data.round);
-        break;
 
       case 'LAST_WILL_SUBMIT':
         lastWillsStore.current[data.playerId] = data.text;
         break;
+
+      // ── Host game engine ───────────────────────────────────────
+      case 'NIGHT_ACTIONS_RECEIVED':
+        if (s.playerId === s.hostId)
+          handleNightActions(data.nightActions, data.round);
+        break;
+
+      case 'VOTES_RECEIVED':
+        if (s.playerId === s.hostId)
+          handleVotes(data.votes, data.round);
+        break;
     }
   }
 
-  function handlePrivateMessage(data) {
+  // ── Handle private messages ───────────────────────────────────
+  function handlePrivate(data) {
     switch (data.type) {
       case 'YOUR_ROLE':
         dispatch({ type: 'PATCH', payload: {
-          myRole: data.role, mafiaTeam: data.mafiaTeam || [], screen: 'role_reveal',
+          myRole: data.role, mafiaTeam: data.mafiaTeam || [],
+          screen: 'role_reveal',
         }});
         break;
       case 'NIGHT_ACTION_PROMPT':
@@ -405,71 +316,68 @@ export function GameProvider({ children }) {
     }
   }
 
-  // ── HOST heartbeat — publish every 10s so others know host is alive ─
-  useEffect(() => {
-    const s = state;
-    if (s.playerId !== s.hostId || !s.roomCode) return;
-    const client = getClient();
-    if (!client) return;
-    const ch = client.channels.get(`mafia-heartbeat-${s.roomCode}`);
-    const id = setInterval(() => {
-      ch.publish('heartbeat', { type: 'ALIVE', hostId: s.playerId });
-      publishSnapshot();
-    }, 10000);
-    return () => clearInterval(id);
-  }, [state.hostId, state.playerId, state.roomCode]);
-
-  // ── HOST logic ─────────────────────────────────────────────────
-  function handleNightActionsAsHost(incoming, round) {
+  // ── HOST: accumulate night actions ────────────────────────────
+  function handleNightActions(incoming, round) {
     const s = stateRef.current;
     if (s.round !== round) return;
     nightActionsStore.current = { ...nightActionsStore.current, ...incoming };
     if (checkNightComplete(s.players, nightActionsStore.current))
-      setTimeout(() => processNightAsHost(round), 1500);
+      setTimeout(() => resolveNightPhase(round), 1500);
   }
 
-  function handleVotesAsHost(incoming, round) {
+  // ── HOST: accumulate votes ────────────────────────────────────
+  function handleVotes(incoming, round) {
     const s = stateRef.current;
     if (s.round !== round) return;
     votesStore.current = { ...votesStore.current, ...incoming };
     pub({ type: 'VOTE_CAST', votes: votesStore.current });
     if (checkVotesComplete(s.players, votesStore.current)) {
       if (voteTimerRef.current) { clearTimeout(voteTimerRef.current); voteTimerRef.current = null; }
-      setTimeout(() => processVotesAsHost(round), 1500);
+      setTimeout(() => resolveDayPhase(round), 1500);
     }
   }
 
-  function processNightAsHost(round) {
+  // ── HOST: resolve night ───────────────────────────────────────
+  function resolveNightPhase(round) {
     const s = stateRef.current;
-    const { players, eliminated, nightLog, gameLogEntries } = resolveNight(s.players, nightActionsStore.current, round);
+    const { players, eliminated, nightLog, gameLogEntries } =
+      resolveNight(s.players, nightActionsStore.current, round);
     const newGameLog = [...s.gameLog, ...gameLogEntries];
     const newEliminated = [...s.eliminatedPlayers, ...eliminated];
     nightActionsStore.current = {};
+
     const revealedWills = {};
     for (const e of eliminated) {
-      if (lastWillsStore.current[e.id]) revealedWills[e.id] = lastWillsStore.current[e.id];
-      pub({ type: 'PLAYER_ELIMINATED', playerId: e.id, eliminatedPlayers: newEliminated, lastWill: lastWillsStore.current[e.id] || null });
+      const will = lastWillsStore.current[e.id];
+      if (will) revealedWills[e.id] = will;
+      pub({ type: 'PLAYER_ELIMINATED', playerId: e.id, eliminatedPlayers: newEliminated, lastWill: will || null });
     }
+
     const winner = checkWinCondition(players);
     if (winner) {
       pub({ type: 'GAME_ENDED', winner, jesterWinner: null, players, gameLog: newGameLog, eliminatedPlayers: newEliminated });
       return;
     }
+
     votesStore.current = {};
     const vs = s.settings.voteTimerSeconds;
     pub({ type: 'DAY_START', nightLog, players, eliminatedPlayers: newEliminated, gameLog: newGameLog, round, voteTimerSeconds: vs, revealedWills });
-    if (vs > 0) voteTimerRef.current = setTimeout(() => processVotesAsHost(round), vs * 1000);
+    if (vs > 0) voteTimerRef.current = setTimeout(() => resolveDayPhase(round), vs * 1000);
   }
 
-  function processVotesAsHost(round) {
+  // ── HOST: resolve day votes ───────────────────────────────────
+  function resolveDayPhase(round) {
     const s = stateRef.current;
-    const { players, eliminated, gameLogEntries, jesterWin } = resolveVotes(s.players, votesStore.current, round);
+    const { players, eliminated, gameLogEntries, jesterWin } =
+      resolveVotes(s.players, votesStore.current, round);
     const newGameLog = [...s.gameLog, ...gameLogEntries];
     const newEliminated = [...s.eliminatedPlayers, ...eliminated];
     votesStore.current = {};
+
     for (const e of eliminated) {
       pub({ type: 'PLAYER_ELIMINATED', playerId: e.id, eliminatedPlayers: newEliminated, lastWill: lastWillsStore.current[e.id] || null });
     }
+
     if (jesterWin) {
       pub({ type: 'GAME_ENDED', winner: 'jester', jesterWinner: jesterWin, players, gameLog: newGameLog, eliminatedPlayers: newEliminated });
       return;
@@ -479,66 +387,81 @@ export function GameProvider({ children }) {
       pub({ type: 'GAME_ENDED', winner, jesterWinner: null, players, gameLog: newGameLog, eliminatedPlayers: newEliminated });
       return;
     }
-    setTimeout(() => startNightAsHost(round + 1, players, newGameLog, newEliminated), 2000);
+    setTimeout(() => startNight(round + 1, players, newGameLog, newEliminated), 2000);
   }
 
-  function startNightAsHost(round, playersArg, gameLogArg, eliminatedArg) {
+  // ── HOST: start night phase ───────────────────────────────────
+  function startNight(round, playersArg, gameLogArg, eliminatedArg) {
     const s = stateRef.current;
     const players = playersArg || s.players;
     nightActionsStore.current = {};
     pub({ type: 'NIGHT_START', round });
+
     for (const player of players) {
       const alive = players.filter(p => p.alive);
-      if (!player.alive) { pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'dead', targets: [] }); continue; }
+      if (!player.alive) {
+        pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'dead', targets: [] });
+        continue;
+      }
+      const aliveTargets = (filter) => alive.filter(filter).map(p => ({ id: p.id, name: p.name, avatar: p.avatar }));
       switch (player.role) {
-        case 'mafia': case 'godfather': {
-          const targets = alive.filter(p => !isMafiaRole(p.role)).map(p => ({ id: p.id, name: p.name, avatar: p.avatar }));
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: player.role, targets }); break;
-        }
+        case 'mafia': case 'godfather':
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: player.role, targets: aliveTargets(p => !isMafiaRole(p.role)) }); break;
         case 'doctor':
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'doctor', targets: alive.map(p => ({ id: p.id, name: p.name, avatar: p.avatar })) }); break;
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'doctor', targets: aliveTargets(() => true) }); break;
         case 'detective':
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'detective', targets: alive.filter(p => p.id !== player.id).map(p => ({ id: p.id, name: p.name, avatar: p.avatar })) }); break;
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'detective', targets: aliveTargets(p => p.id !== player.id) }); break;
         case 'sheriff':
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: player.sheriffShotUsed ? 'sheriff_used' : 'sheriff', targets: alive.filter(p => p.id !== player.id).map(p => ({ id: p.id, name: p.name, avatar: p.avatar })) }); break;
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: player.sheriffShotUsed ? 'sheriff_used' : 'sheriff', targets: aliveTargets(p => p.id !== player.id) }); break;
         case 'witch':
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'witch', targets: alive.filter(p => p.id !== player.id).map(p => ({ id: p.id, name: p.name, avatar: p.avatar })), blockUsed: player.witchBlockUsed }); break;
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'witch', targets: aliveTargets(p => p.id !== player.id), blockUsed: player.witchBlockUsed }); break;
         case 'bodyguard':
-          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'bodyguard', targets: alive.filter(p => p.id !== player.id).map(p => ({ id: p.id, name: p.name, avatar: p.avatar })) }); break;
+          pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: 'bodyguard', targets: aliveTargets(p => p.id !== player.id) }); break;
         default:
           pubPrivate(player.id, { type: 'NIGHT_ACTION_PROMPT', role: player.role, targets: [] });
       }
     }
   }
 
-  // ── Public actions ─────────────────────────────────────────────
+  // ── Actions exposed to UI ─────────────────────────────────────
   const actions = {
+
     createRoom: (name, avatar) => {
       const playerId = crypto.randomUUID();
       const roomCode = Math.random().toString(36).substring(2, 7).toUpperCase();
       dispatch({ type: 'PATCH', payload: {
-        playerId, playerName: name, playerAvatar: avatar, roomCode, hostId: playerId,
+        playerId, playerName: name, playerAvatar: avatar,
+        roomCode, hostId: playerId,
         players: [{ id: playerId, name, avatar, alive: true, role: null, isHost: true }],
         screen: 'lobby',
       }});
       connectToRoom(roomCode, playerId);
-      setTimeout(() => pub({ type: 'PLAYER_JOINED', player: { id: playerId, name, avatar, alive: true, isHost: true }, password: '' }), 800);
+      // Announce self after channel connects
+      setTimeout(() => pub({
+        type: 'PLAYER_JOINED',
+        player: { id: playerId, name, avatar, alive: true, isHost: true },
+        password: '',
+      }), 800);
     },
 
     joinRoom: (name, avatar, roomCode, password) => {
       const playerId = crypto.randomUUID();
-      dispatch({ type: 'PATCH', payload: { playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby' } });
+      dispatch({ type: 'PATCH', payload: {
+        playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby',
+      }});
       connectToRoom(roomCode, playerId);
       setTimeout(() => {
+        // Announce self
         pub({ type: 'PLAYER_JOINED', player: { id: playerId, name, avatar, alive: true, isHost: false }, password });
-        // Request full player list from host
-        setTimeout(() => pub({ type: 'REQUEST_SNAPSHOT', playerId }), 500);
       }, 800);
     },
 
     joinAsSpectator: (name, avatar, roomCode) => {
       const playerId = crypto.randomUUID();
-      dispatch({ type: 'PATCH', payload: { playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby', isSpectator: true } });
+      dispatch({ type: 'PATCH', payload: {
+        playerId, playerName: name, playerAvatar: avatar,
+        roomCode, screen: 'lobby', isSpectator: true,
+      }});
       connectToRoom(roomCode, playerId);
       setTimeout(() => pub({ type: 'SPECTATOR_JOINED', player: { id: playerId, name, avatar } }), 800);
     },
@@ -547,7 +470,7 @@ export function GameProvider({ children }) {
       const s = stateRef.current;
       if (s.playerId !== s.hostId) return;
       dispatch({ type: 'PATCH', payload: { players: s.players.filter(p => p.id !== targetId) } });
-      pub({ type: 'PLAYER_KICKED', playerId: targetId });
+      pub({ type: 'KICKED', playerId: targetId });
     },
 
     startGame: () => {
@@ -557,13 +480,14 @@ export function GameProvider({ children }) {
       const rolesInGame = [...new Set(assignedPlayers.map(p => p.role))];
       for (const player of assignedPlayers) {
         const mafiaTeam = isMafiaRole(player.role)
-          ? assignedPlayers.filter(p => isMafiaRole(p.role) && p.id !== player.id).map(p => ({ id: p.id, name: p.name, role: p.role, avatar: p.avatar }))
+          ? assignedPlayers.filter(p => isMafiaRole(p.role) && p.id !== player.id)
+              .map(p => ({ id: p.id, name: p.name, role: p.role, avatar: p.avatar }))
           : [];
         pubPrivate(player.id, { type: 'YOUR_ROLE', role: player.role, mafiaTeam });
       }
       dispatch({ type: 'PATCH', payload: { players: assignedPlayers, rolesInGame } });
       pub({ type: 'GAME_STARTED', rolesInGame });
-      setTimeout(() => startNightAsHost(1, assignedPlayers, [], []), 3000);
+      setTimeout(() => startNight(1, assignedPlayers, [], []), 3000);
     },
 
     updateSettings: (settings) => {
@@ -577,28 +501,28 @@ export function GameProvider({ children }) {
     submitNightAction: (targetId, actionType) => {
       const s = stateRef.current;
       const player = s.players.find(p => p.id === s.playerId);
-      let actions_update = {};
+      let update = {};
       if (!player?.alive) {
-        actions_update[`skip_${s.playerId}`] = 'done';
+        update[`skip_${s.playerId}`] = 'done';
       } else {
         const role = player.role;
-        if (role === 'mafia' || role === 'godfather') actions_update['mafia'] = targetId;
-        else if (role === 'doctor') actions_update['doctor'] = targetId;
+        if (role === 'mafia' || role === 'godfather') update['mafia'] = targetId;
+        else if (role === 'doctor') update['doctor'] = targetId;
         else if (role === 'detective') {
-          actions_update['detective'] = targetId;
+          update['detective'] = targetId;
           const target = s.players.find(p => p.id === targetId);
           if (target) dispatch({ type: 'PATCH', payload: { detectiveResult: { targetName: target.name, isMafia: target.role === 'mafia' } } });
         }
-        else if (role === 'sheriff') { actions_update['sheriff'] = targetId; }
-        else if (role === 'bodyguard') actions_update['bodyguard'] = targetId;
+        else if (role === 'sheriff') update['sheriff'] = targetId;
+        else if (role === 'bodyguard') update['bodyguard'] = targetId;
         else if (role === 'witch') {
-          if (actionType === 'block') actions_update['witch_block'] = targetId;
-          actions_update[`skip_${s.playerId}`] = 'done';
+          if (actionType === 'block') update['witch_block'] = targetId;
+          update[`skip_${s.playerId}`] = 'done';
         }
-        else actions_update[`skip_${s.playerId}`] = 'done';
+        else update[`skip_${s.playerId}`] = 'done';
       }
       dispatch({ type: 'PATCH', payload: { actionConfirmed: true } });
-      pub({ type: 'NIGHT_ACTIONS_RECEIVED', nightActions: actions_update, round: s.round });
+      pub({ type: 'NIGHT_ACTIONS_RECEIVED', nightActions: update, round: s.round });
     },
 
     castVote: (targetId) => {
@@ -614,9 +538,9 @@ export function GameProvider({ children }) {
       if (s.playerId === s.hostId) {
         const tally = {};
         for (const v of Object.values(newMvpVotes)) tally[v] = (tally[v] || 0) + 1;
-        const mvp = Object.entries(tally).sort((a,b)=>b[1]-a[1])[0];
-        const mvpPlayer = s.players.find(p => p.id === mvp?.[0]);
-        if (mvpPlayer) pub({ type: 'MVP_RESULT', mvpResult: { name: mvpPlayer.name, avatar: mvpPlayer.avatar, votes: mvp[1] } });
+        const top = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+        const mvpPlayer = s.players.find(p => p.id === top?.[0]);
+        if (mvpPlayer) pub({ type: 'MVP_RESULT', mvpResult: { name: mvpPlayer.name, avatar: mvpPlayer.avatar, votes: top[1] } });
       }
     },
 
