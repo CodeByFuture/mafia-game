@@ -233,7 +233,11 @@ export function GameProvider({ children }) {
     switch (data.type) {
 
       case 'REQUEST_SNAPSHOT':
-        if (s.playerId === s.hostId) publishSnapshot();
+        if (s.playerId === s.hostId) {
+          publishSnapshot();
+          // Also send players sync on main channel immediately
+          pub({ type: 'PLAYERS_SYNC', players: s.players, hostId: s.playerId, settings: s.settings });
+        }
         break;
 
       case 'HOST_MIGRATED':
@@ -248,14 +252,30 @@ export function GameProvider({ children }) {
           }
           return;
         }
-        if (!s.players.find(p => p.id === data.player.id))
-          dispatch({ type: 'PATCH', payload: { players: [...s.players, data.player] } });
+        const alreadyExists = s.players.find(p => p.id === data.player.id);
+        const newPlayers = alreadyExists ? s.players : [...s.players, data.player];
+        dispatch({ type: 'PATCH', payload: { players: newPlayers } });
+        // Host broadcasts full player list so everyone syncs
+        if (s.playerId === s.hostId) {
+          setTimeout(() => {
+            pub({ type: 'PLAYERS_SYNC', players: stateRef.current.players, hostId: stateRef.current.playerId, settings: stateRef.current.settings });
+          }, 300);
+        }
         break;
       }
 
       case 'SPECTATOR_JOINED':
         if (!s.spectators.find(p => p.id === data.player.id))
           dispatch({ type: 'PATCH', payload: { spectators: [...s.spectators, data.player] } });
+        break;
+
+      case 'PLAYERS_SYNC':
+        // Full player list from host — sync everyone
+        dispatch({ type: 'PATCH', payload: {
+          players: data.players,
+          hostId: data.hostId,
+          settings: data.settings,
+        }});
         break;
 
       case 'PLAYER_KICKED':
@@ -509,7 +529,11 @@ export function GameProvider({ children }) {
       const playerId = crypto.randomUUID();
       dispatch({ type: 'PATCH', payload: { playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby' } });
       connectToRoom(roomCode, playerId);
-      setTimeout(() => pub({ type: 'PLAYER_JOINED', player: { id: playerId, name, avatar, alive: true, isHost: false }, password }), 800);
+      setTimeout(() => {
+        pub({ type: 'PLAYER_JOINED', player: { id: playerId, name, avatar, alive: true, isHost: false }, password });
+        // Request full player list from host
+        setTimeout(() => pub({ type: 'REQUEST_SNAPSHOT', playerId }), 500);
+      }, 800);
     },
 
     joinAsSpectator: (name, avatar, roomCode) => {
