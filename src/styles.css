@@ -1290,3 +1290,93 @@ body {
 .lb-name { flex:1; font-size:15px; }
 .lb-wins { color:var(--text-muted); font-size:13px; }
 .lb-rate { color:var(--gold); font-weight:700; min-width:36px; text-align:right; }
+
+/* ============================
+   PHASE TRANSITIONS
+   ============================ */
+.transition-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  animation: transitionFade 0.6s ease-in-out;
+}
+.transition-overlay.to_night {
+  background: radial-gradient(ellipse at center, rgba(10,0,30,0.98) 0%, rgba(0,0,0,0.99) 100%);
+}
+.transition-overlay.to_day {
+  background: radial-gradient(ellipse at center, rgba(201,168,76,0.15) 0%, rgba(10,10,15,0.98) 100%);
+}
+@keyframes transitionFade {
+  0% { opacity: 0; }
+  30% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.transition-content { text-align: center; }
+.trans-moon { font-size: 72px; animation: moonRise 0.6s ease-out; }
+.trans-sun  { font-size: 72px; animation: sunRise 0.6s ease-out; }
+@keyframes moonRise { from { transform: translateY(40px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@keyframes sunRise  { from { transform: translateY(40px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.trans-text {
+  font-family: var(--font-display); font-size: 28px; font-weight: 700;
+  color: var(--text); margin-top: 16px; letter-spacing: 4px; text-transform: uppercase;
+  animation: fadeInUp 0.4s ease-out 0.1s both;
+}
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ============================
+   RECONNECT SCREEN
+   ============================ */
+.reconnect-screen { justify-content: center; align-items: center; }
+
+/* ============================
+   SPECTATE SCREEN
+   ============================ */
+.spectate-screen { background: var(--bg); }
+.spectate-bg {
+  position: fixed; inset: 0;
+  background: radial-gradient(ellipse at top, rgba(66,153,225,0.06) 0%, transparent 60%);
+  pointer-events: none;
+}
+.spectate-content { position: relative; z-index: 1; padding: 20px; display: flex; flex-direction: column; gap: 20px; max-width: 500px; margin: 0 auto; }
+.spectate-header { display: flex; align-items: center; gap: 14px; padding: 12px 0; }
+.spec-eye { font-size: 32px; }
+.spec-title { font-family: var(--font-display); font-size: 24px; font-weight: 700; }
+.spec-phase { color: var(--text-muted); font-size: 14px; margin-top: 2px; }
+.spec-night-report { padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; font-style: italic; color: var(--text-muted); }
+.spec-section { }
+.spec-players { display: flex; flex-direction: column; gap: 6px; }
+.spec-player {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  transition: opacity 0.3s;
+}
+.spec-player.dead { opacity: 0.4; }
+.spec-avatar { font-size: 20px; flex-shrink: 0; }
+.spec-name { flex: 1; font-size: 15px; }
+.spec-role { font-size: 11px; padding: 2px 8px; border-radius: 10px; letter-spacing: 0.5px; }
+.spec-dead { font-size: 14px; }
+.spec-votes { display: flex; flex-direction: column; gap: 6px; }
+.spec-vote-row { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.spec-vote-avatar { font-size: 16px; flex-shrink: 0; }
+.spec-vote-name { min-width: 80px; color: var(--text-muted); }
+.spec-vote-bar-wrap { flex: 1; height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; }
+.spec-vote-bar { height: 100%; background: #e53e3e; border-radius: 3px; transition: width 0.4s ease; }
+.spec-vote-count { color: #e53e3e; font-weight: 700; min-width: 16px; text-align: right; }
+.spec-log { display: flex; flex-direction: column; gap: 4px; }
+.spec-log-entry { display: flex; gap: 8px; font-size: 13px; color: var(--text-muted); padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+
+/* ============================
+   HOST MIGRATION TOAST
+   ============================ */
+.host-migrated-toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: rgba(72,187,120,0.15); border: 1px solid rgba(72,187,120,0.3);
+  color: #48bb78; padding: 10px 20px; border-radius: 20px;
+  font-size: 13px; z-index: 999; animation: toastIn 0.3s ease;
+}
+@keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(10px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
+
+/* Screen enter animation */
+.screen { animation: screenEnter 0.3s ease-out; }
+@keyframes screenEnter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
