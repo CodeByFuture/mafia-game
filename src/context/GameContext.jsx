@@ -11,7 +11,7 @@ const initialState = {
   screen: 'home',
   playerId: null, playerName: null, playerAvatar: '🎭',
   myRole: null, mafiaTeam: [],
-  roomCode: null, players: [], spectators: [],
+  roomCode: null, players: [],
   phase: 'lobby', round: 0,
   settings: {
     mafiaCount: 1, hasDoctor: true, hasDetective: true,
@@ -26,7 +26,7 @@ const initialState = {
   voteTimerSeconds: 0, voteTimerActive: false,
   winner: null, jesterWinner: null,
   mvpVotes: {}, mvpResult: null, lastWills: {}, myLastWill: '',
-  error: null, isSpectator: false, rolesInGame: [],
+  error: null, rolesInGame: [],
   transitioning: false, transitionType: null,
 };
 
@@ -48,42 +48,26 @@ export function GameProvider({ children }) {
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // Per-tab refs — never shared between tabs
-  const clientRef = useRef(null);   // Ably client (one per tab)
-  const channelRef = useRef(null);  // Public room channel
-  const myIdRef = useRef(null);     // This tab's playerId
+  // Each tab gets its own everything - stored in refs not module scope
+  const ablyRef = useRef(null);
+  const channelRef = useRef(null);
+  const myIdRef = useRef(null);
   const nightActionsStore = useRef({});
   const votesStore = useRef({});
   const voteTimerRef = useRef(null);
   const lastWillsStore = useRef({});
 
-  // ── Create a brand new Ably client for this tab ───────────────
-  function makeClient(playerId) {
-    const key = import.meta.env.VITE_ABLY_KEY;
-    if (!key) return null;
-    // Unique clientId per tab — critical for same-browser multi-tab
-    const client = new Ably.Realtime({
-      key,
-      clientId: playerId,
-    });
-    clientRef.current = client;
-    return client;
-  }
-
-  // ── Publish to room channel ───────────────────────────────────
   const pub = useCallback((msg) => {
     channelRef.current?.publish('game', msg);
   }, []);
 
-  // ── Publish to a specific player's private channel ────────────
   const pubPrivate = useCallback((targetId, msg) => {
     const roomCode = stateRef.current.roomCode;
-    clientRef.current?.channels
+    ablyRef.current?.channels
       .get(`mafia-private-${roomCode}-${targetId}`)
       .publish('private', msg);
   }, []);
 
-  // ── Animated phase transition ─────────────────────────────────
   const transitionTo = useCallback((screen, type, payload) => {
     dispatch({ type: 'PATCH', payload: { transitioning: true, transitionType: type } });
     setTimeout(() => {
@@ -91,69 +75,53 @@ export function GameProvider({ children }) {
     }, 600);
   }, []);
 
-  // ── Connect to a room ─────────────────────────────────────────
-  const connectToRoom = useCallback((roomCode, playerId, presenceData) => {
-    const client = makeClient(playerId);
-    if (!client) {
-      dispatch({ type: 'SET_ERROR', error: 'Ably key not set.' });
-      return;
-    }
+  const connectToRoom = useCallback((roomCode, playerId) => {
+    const key = import.meta.env.VITE_ABLY_KEY;
+    if (!key) { dispatch({ type: 'SET_ERROR', error: 'No Ably key found.' }); return; }
 
+    // Fresh Ably instance per tab - stored in ref not module variable
+    const ably = new Ably.Realtime({ key, clientId: playerId });
+    ablyRef.current = ably;
     myIdRef.current = playerId;
 
-    // ── Public channel ─────────────────────────────────────────
-    const ch = client.channels.get(`mafia-room-${roomCode}`);
+    ably.connection.on('failed', () => {
+      dispatch({ type: 'SET_ERROR', error: 'Connection failed. Check internet.' });
+    });
+
+    // Public channel
+    const ch = ably.channels.get(`mafia-room-${roomCode}`);
     channelRef.current = ch;
-
-    // Use Ably Presence for player list — it auto-syncs across all tabs/devices
-    ch.presence.enter(presenceData);
-
-    // Someone entered → rebuild player list
-    ch.presence.subscribe('enter', () => syncPresence(ch));
-    // Someone left
-    ch.presence.subscribe('leave', () => syncPresence(ch));
-    // Data updated
-    ch.presence.subscribe('update', () => syncPresence(ch));
-
-    // Get everyone already in the room
-    syncPresence(ch);
-
-    // Game events
     ch.subscribe('game', (msg) => handleMsg(msg.data));
 
-    // ── Private channel for this player ───────────────────────
-    client.channels
-      .get(`mafia-private-${roomCode}-${playerId}`)
+    // Private channel
+    ably.channels.get(`mafia-private-${roomCode}-${playerId}`)
       .subscribe('private', (msg) => handlePrivate(msg.data));
 
   }, []); // eslint-disable-line
 
-  // ── Rebuild player list from Presence ────────────────────────
-  function syncPresence(ch) {
-    ch.presence.get((err, members) => {
-      if (err || !members) return;
-      const players = members
-        .filter(m => m.data && !m.data.isSpectator)
-        .map(m => ({ ...m.data }));
-      const spectators = members
-        .filter(m => m.data?.isSpectator)
-        .map(m => ({ ...m.data }));
-      const hostId = players.find(p => p.isHost)?.id || stateRef.current.hostId;
-      dispatch({ type: 'PATCH', payload: { players, spectators, hostId } });
-    });
-  }
-
-  // ── Update our own presence data (e.g. after role assigned) ───
-  function updatePresence(ch, data) {
-    ch?.presence.update(data);
-  }
-
-  // ── Handle public game messages ───────────────────────────────
   function handleMsg(data) {
     const s = stateRef.current;
     const myId = myIdRef.current;
 
     switch (data.type) {
+
+      case 'PLAYER_JOINED': {
+        // Skip if already in list
+        if (s.players.find(p => p.id === data.player.id)) break;
+        const newPlayers = [...s.players, data.player];
+        dispatch({ type: 'PATCH', payload: { players: newPlayers, hostId: data.hostId || s.hostId } });
+        break;
+      }
+
+      case 'PLAYER_LIST': {
+        // Full authoritative list from host
+        dispatch({ type: 'PATCH', payload: {
+          players: data.players,
+          hostId: data.hostId,
+          settings: data.settings || s.settings,
+        }});
+        break;
+      }
 
       case 'SETTINGS_UPDATED':
         dispatch({ type: 'PATCH', payload: { settings: data.settings } });
@@ -163,6 +131,10 @@ export function GameProvider({ children }) {
         if (data.playerId === myId) {
           dispatch({ type: 'RESET' });
           dispatch({ type: 'SET_ERROR', error: data.reason || 'You were kicked.' });
+        } else {
+          dispatch({ type: 'PATCH', payload: {
+            players: s.players.filter(p => p.id !== data.playerId)
+          }});
         }
         break;
 
@@ -171,24 +143,22 @@ export function GameProvider({ children }) {
         break;
 
       case 'NIGHT_START':
-        transitionTo(
-          s.isSpectator ? 'spectate' : 'night', 'to_night',
-          { phase: 'night', round: data.round, actionConfirmed: false, detectiveResult: null, nightLog: [], votes: {}, nightAction: null }
-        );
+        transitionTo('night', 'to_night', {
+          phase: 'night', round: data.round,
+          actionConfirmed: false, detectiveResult: null,
+          nightLog: [], votes: {}, nightAction: null
+        });
         break;
 
       case 'DAY_START':
-        transitionTo(
-          s.isSpectator ? 'spectate' : 'day', 'to_day',
-          {
-            phase: 'day', nightLog: data.nightLog,
-            players: data.players, eliminatedPlayers: data.eliminatedPlayers,
-            gameLog: data.gameLog, votes: {},
-            voteTimerActive: data.voteTimerSeconds > 0,
-            voteTimerSeconds: data.voteTimerSeconds,
-            lastWills: { ...s.lastWills, ...(data.revealedWills || {}) },
-          }
-        );
+        transitionTo('day', 'to_day', {
+          phase: 'day', nightLog: data.nightLog,
+          players: data.players, eliminatedPlayers: data.eliminatedPlayers,
+          gameLog: data.gameLog, votes: {},
+          voteTimerActive: data.voteTimerSeconds > 0,
+          voteTimerSeconds: data.voteTimerSeconds,
+          lastWills: { ...s.lastWills, ...(data.revealedWills || {}) },
+        });
         break;
 
       case 'VOTE_CAST':
@@ -256,10 +226,16 @@ export function GameProvider({ children }) {
       case 'VOTES_RECEIVED':
         if (myId === s.hostId) handleVotes(data.votes, data.round);
         break;
+
+      case 'REQUEST_LIST':
+        // Someone is asking for the player list - only host responds
+        if (myId === s.hostId) {
+          pub({ type: 'PLAYER_LIST', players: stateRef.current.players, hostId: myId, settings: stateRef.current.settings });
+        }
+        break;
     }
   }
 
-  // ── Handle private messages ───────────────────────────────────
   function handlePrivate(data) {
     switch (data.type) {
       case 'YOUR_ROLE':
@@ -281,7 +257,6 @@ export function GameProvider({ children }) {
     }
   }
 
-  // ── HOST: accumulate night actions ────────────────────────────
   function handleNightActions(incoming, round) {
     const s = stateRef.current;
     if (s.round !== round) return;
@@ -290,7 +265,6 @@ export function GameProvider({ children }) {
       setTimeout(() => resolveNightPhase(round), 1500);
   }
 
-  // ── HOST: accumulate votes ────────────────────────────────────
   function handleVotes(incoming, round) {
     const s = stateRef.current;
     if (s.round !== round) return;
@@ -302,7 +276,6 @@ export function GameProvider({ children }) {
     }
   }
 
-  // ── HOST: resolve night ───────────────────────────────────────
   function resolveNightPhase(round) {
     const s = stateRef.current;
     const { players, eliminated, nightLog, gameLogEntries } = resolveNight(s.players, nightActionsStore.current, round);
@@ -326,7 +299,6 @@ export function GameProvider({ children }) {
     if (vs > 0) voteTimerRef.current = setTimeout(() => resolveDayPhase(round), vs * 1000);
   }
 
-  // ── HOST: resolve votes ───────────────────────────────────────
   function resolveDayPhase(round) {
     const s = stateRef.current;
     const { players, eliminated, gameLogEntries, jesterWin } = resolveVotes(s.players, votesStore.current, round);
@@ -348,7 +320,6 @@ export function GameProvider({ children }) {
     setTimeout(() => startNight(round + 1, players, newGameLog, newEliminated), 2000);
   }
 
-  // ── HOST: start night ─────────────────────────────────────────
   function startNight(round, playersArg) {
     const players = playersArg || stateRef.current.players;
     nightActionsStore.current = {};
@@ -376,40 +347,45 @@ export function GameProvider({ children }) {
     }
   }
 
-  // ── UI-facing actions ─────────────────────────────────────────
   const actions = {
 
     createRoom: (name, avatar) => {
       const playerId = crypto.randomUUID();
       const roomCode = Math.random().toString(36).substring(2, 7).toUpperCase();
+      const player = { id: playerId, name, avatar, alive: true, role: null, isHost: true };
       dispatch({ type: 'PATCH', payload: {
         playerId, playerName: name, playerAvatar: avatar,
-        roomCode, hostId: playerId, screen: 'lobby',
-        players: [{ id: playerId, name, avatar, alive: true, role: null, isHost: true }],
+        roomCode, hostId: playerId,
+        players: [player],
+        screen: 'lobby',
       }});
-      connectToRoom(roomCode, playerId, { id: playerId, name, avatar, alive: true, role: null, isHost: true });
+      connectToRoom(roomCode, playerId);
+      // Publish after small delay for channel to attach
+      setTimeout(() => {
+        pub({ type: 'PLAYER_JOINED', player, hostId: playerId });
+      }, 1500);
     },
 
     joinRoom: (name, avatar, roomCode, password) => {
       const playerId = crypto.randomUUID();
+      const player = { id: playerId, name, avatar, alive: true, role: null, isHost: false };
       dispatch({ type: 'PATCH', payload: {
         playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby',
+        players: [player], // add self immediately
       }});
-      connectToRoom(roomCode, playerId, { id: playerId, name, avatar, alive: true, role: null, isHost: false, password });
-    },
-
-    joinAsSpectator: (name, avatar, roomCode) => {
-      const playerId = crypto.randomUUID();
-      dispatch({ type: 'PATCH', payload: {
-        playerId, playerName: name, playerAvatar: avatar,
-        roomCode, screen: 'lobby', isSpectator: true,
-      }});
-      connectToRoom(roomCode, playerId, { id: playerId, name, avatar, isSpectator: true });
+      connectToRoom(roomCode, playerId);
+      setTimeout(() => {
+        // Announce self
+        pub({ type: 'PLAYER_JOINED', player, password: password || '' });
+        // Ask host for full list
+        setTimeout(() => pub({ type: 'REQUEST_LIST' }), 800);
+      }, 1500);
     },
 
     kickPlayer: (targetId) => {
       const s = stateRef.current;
       if (myIdRef.current !== s.hostId) return;
+      dispatch({ type: 'PATCH', payload: { players: s.players.filter(p => p.id !== targetId) } });
       pub({ type: 'KICKED', playerId: targetId });
     },
 
