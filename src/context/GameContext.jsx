@@ -360,10 +360,19 @@ export function GameProvider({ children }) {
         screen: 'lobby',
       }});
       connectToRoom(roomCode, playerId);
-      // Publish after small delay for channel to attach
-      setTimeout(() => {
-        pub({ type: 'PLAYER_JOINED', player, hostId: playerId });
-      }, 1500);
+      // Wait for Ably connection before publishing
+      const waitAndPublish = () => {
+        const ably = ablyRef.current;
+        if (!ably) { setTimeout(waitAndPublish, 200); return; }
+        if (ably.connection.state === 'connected') {
+          pub({ type: 'PLAYER_JOINED', player, hostId: playerId });
+        } else {
+          ably.connection.once('connected', () => {
+            pub({ type: 'PLAYER_JOINED', player, hostId: playerId });
+          });
+        }
+      };
+      setTimeout(waitAndPublish, 300);
     },
 
     joinRoom: (name, avatar, roomCode, password) => {
@@ -371,15 +380,23 @@ export function GameProvider({ children }) {
       const player = { id: playerId, name, avatar, alive: true, role: null, isHost: false };
       dispatch({ type: 'PATCH', payload: {
         playerId, playerName: name, playerAvatar: avatar, roomCode, screen: 'lobby',
-        players: [player], // add self immediately
+        players: [player],
       }});
       connectToRoom(roomCode, playerId);
-      setTimeout(() => {
-        // Announce self
-        pub({ type: 'PLAYER_JOINED', player, password: password || '' });
-        // Ask host for full list
-        setTimeout(() => pub({ type: 'REQUEST_LIST' }), 800);
-      }, 1500);
+      const waitAndPublish = () => {
+        const ably = ablyRef.current;
+        if (!ably) { setTimeout(waitAndPublish, 200); return; }
+        if (ably.connection.state === 'connected') {
+          pub({ type: 'PLAYER_JOINED', player, password: password || '' });
+          setTimeout(() => pub({ type: 'REQUEST_LIST' }), 500);
+        } else {
+          ably.connection.once('connected', () => {
+            pub({ type: 'PLAYER_JOINED', player, password: password || '' });
+            setTimeout(() => pub({ type: 'REQUEST_LIST' }), 500);
+          });
+        }
+      };
+      setTimeout(waitAndPublish, 300);
     },
 
     kickPlayer: (targetId) => {
