@@ -1,142 +1,123 @@
-import { useState } from 'react';
-import { useGame } from '../context/GameContext';
+import { useState } from 'react'
+import { useGame } from '../context/GameContext'
 
-const ROLE_SETTINGS = [
-  { key:'hasDoctor',    label:'Doctor',     icon:'💉', desc:'Saves one per night' },
-  { key:'hasDetective', label:'Detective',  icon:'🔍', desc:'Investigates one per night' },
-  { key:'hasSheriff',   label:'Sheriff',    icon:'⭐', desc:'One risky shot per game' },
-  { key:'hasGodfather', label:'Godfather',  icon:'🎩', desc:'Mafia boss, appears innocent' },
-  { key:'hasJester',    label:'Jester',     icon:'🤡', desc:'Wins if voted out' },
-  { key:'hasBomber',    label:'Bomber',     icon:'💣', desc:'Kills someone on death' },
-  { key:'hasWitch',     label:'Witch',      icon:'🧙', desc:'Blocks one action per game' },
-  { key:'hasMayor',     label:'Mayor',      icon:'🏛️', desc:'Double vote when revealed' },
-  { key:'hasBodyguard', label:'Bodyguard',  icon:'🛡️', desc:'Dies protecting their target' },
-];
+const ROLES = [
+  { k:'hasDoctor', l:'Doctor', i:'💉', d:'Saves one per night' },
+  { k:'hasDetective', l:'Detective', i:'🔍', d:'Investigates one per night' },
+  { k:'hasSheriff', l:'Sheriff', i:'⭐', d:'One risky shot' },
+  { k:'hasGodfather', l:'Godfather', i:'🎩', d:'Appears innocent' },
+  { k:'hasJester', l:'Jester', i:'🤡', d:'Wins if voted out' },
+  { k:'hasBomber', l:'Bomber', i:'💣', d:'Kills on death' },
+  { k:'hasWitch', l:'Witch', i:'🧙', d:'Blocks one action' },
+  { k:'hasMayor', l:'Mayor', i:'🏛️', d:'Double vote' },
+  { k:'hasBodyguard', l:'Bodyguard', i:'🛡️', d:'Dies protecting target' },
+]
 
 export default function LobbyScreen() {
-  const { state, actions } = useGame();
-  const { players, spectators, playerId, hostId, roomCode, settings, rolesInGame } = state;
-  const [copied, setCopied] = useState(false);
-  const [showRoles, setShowRoles] = useState(false);
+  const { state, actions } = useGame()
+  const { players, playerId, hostId, roomCode, settings } = state
+  const [copied, setCopied] = useState(false)
+  const isHost = playerId === hostId
+  const canStart = players.length >= 4
 
-  const isHost = playerId === hostId;
-  const canStart = players.length >= 4;
-  const toggle = (key) => actions.updateSettings({ [key]: !settings[key] });
-  const setMafiaCount = (n) => actions.updateSettings({ mafiaCount: Math.max(1, Math.min(Math.floor(players.length/3)||1, n)) });
-  const setJesterCount = (n) => actions.updateSettings({ jesterCount: Math.max(1, Math.min(3, n)) });
-
-  const copyCode = () => {
-    navigator.clipboard?.writeText(roomCode).catch(()=>{});
-    setCopied(true); setTimeout(()=>setCopied(false), 2000);
-  };
-  const shareLink = () => {
-    navigator.clipboard?.writeText(`${window.location.origin}?join=${roomCode}`).catch(()=>{});
-    setCopied(true); setTimeout(()=>setCopied(false), 2000);
-  };
+  const copy = () => { navigator.clipboard?.writeText(roomCode).catch(()=>{}); setCopied(true); setTimeout(()=>setCopied(false),2000) }
+  const shareLink = () => { navigator.clipboard?.writeText(`${window.location.origin}?join=${roomCode}`).catch(()=>{}); setCopied(true); setTimeout(()=>setCopied(false),2000) }
+  const upd = s => actions.updateSettings(s)
+  const tog = k => upd({ [k]: !settings[k] })
 
   return (
     <div className="screen lobby-screen">
-      <div className="lobby-header">
-        <div className="room-code-display" onClick={copyCode}>
-          <span className="room-label">ROOM CODE — TAP TO COPY</span>
-          <span className="room-code">{roomCode}</span>
-          {copied && <span className="copied-badge">Copied!</span>}
+      <div className="lobby-top">
+        <div className="room-code-box" onClick={copy}>
+          <span className="rc-label">ROOM CODE — TAP TO COPY</span>
+          <span className="rc-code">{roomCode}</span>
+          {copied && <span className="rc-copied">Copied!</span>}
         </div>
-        <button className="share-link-btn" onClick={shareLink}>🔗 Copy invite link</button>
+        <button className="share-btn" onClick={shareLink}>🔗 Copy invite link</button>
       </div>
 
       <div className="lobby-body">
-        {/* Players list */}
-        <div className="players-section">
-          <h3 className="section-title">Players <span className="player-count">{players.length}/20</span></h3>
+        <div className="section">
+          <div className="section-title">Players <span className="badge">{players.length}/20</span></div>
           <div className="players-list">
-            {players.map(p => (
-              <div key={p.id} className={`player-chip ${p.id===playerId?'me':''}`}>
-                <span className="player-avatar-emoji">{p.avatar || '🎭'}</span>
-                <span className="player-name">{p.name}</span>
-                {p.id===hostId && <span className="host-badge">HOST</span>}
-                {p.id===playerId && <span className="me-badge">YOU</span>}
-                {isHost && p.id!==playerId && (
-                  <button className="kick-btn" onClick={()=>actions.kickPlayer(p.id)} title="Kick player">✕</button>
-                )}
+            {players.map(pl => (
+              <div key={pl.id} className={`player-row ${pl.id===playerId?'me':''}`}>
+                <span className="pl-av">{pl.avatar||'🎭'}</span>
+                <span className="pl-name">{pl.name}</span>
+                {pl.id===hostId && <span className="badge-host">HOST</span>}
+                {pl.id===playerId && <span className="badge-you">YOU</span>}
+                {isHost && pl.id!==playerId && <button className="kick-btn" onClick={()=>actions.kickPlayer(pl.id)}>✕</button>}
               </div>
             ))}
-            {spectators.length > 0 && (
-              <div className="spectators-row">
-                <span className="spec-label">👁️ Watching:</span>
-                {spectators.map(s => <span key={s.id} className="spec-name">{s.avatar} {s.name}</span>)}
-              </div>
-            )}
-            {!canStart && <p className="min-players-note">Need {4-players.length} more player{4-players.length>1?'s':''}</p>}
+            {players.length < 4 && <p className="need-more">Need {4-players.length} more player{4-players.length>1?'s':''}</p>}
           </div>
         </div>
 
         {isHost ? (
-          <div className="settings-section">
-            <h3 className="section-title">Game Settings</h3>
+          <div className="section">
+            <div className="section-title">Settings</div>
 
             <div className="setting-row">
-              <span className="setting-label">🔫 Mafia Count</span>
-              <div className="number-control">
-                <button onClick={()=>setMafiaCount(settings.mafiaCount-1)}>−</button>
+              <span>🔫 Mafia Count</span>
+              <div className="num-ctrl">
+                <button onClick={()=>upd({mafiaCount:Math.max(1,settings.mafiaCount-1)})}>−</button>
                 <span>{settings.mafiaCount}</span>
-                <button onClick={()=>setMafiaCount(settings.mafiaCount+1)}>+</button>
+                <button onClick={()=>upd({mafiaCount:Math.min(Math.floor(players.length/3)||1,settings.mafiaCount+1)})}>+</button>
               </div>
             </div>
 
             {settings.hasJester && (
-              <div className="setting-row highlight-jester">
-                <span className="setting-label">🤡 Jester Count</span>
-                <div className="number-control">
-                  <button onClick={()=>setJesterCount((settings.jesterCount||1)-1)}>−</button>
+              <div className="setting-row jester-row">
+                <span>🤡 Jester Count</span>
+                <div className="num-ctrl">
+                  <button onClick={()=>upd({jesterCount:Math.max(1,(settings.jesterCount||1)-1)})}>−</button>
                   <span>{settings.jesterCount||1}</span>
-                  <button onClick={()=>setJesterCount((settings.jesterCount||1)+1)}>+</button>
+                  <button onClick={()=>upd({jesterCount:Math.min(3,(settings.jesterCount||1)+1)})}>+</button>
                 </div>
               </div>
             )}
 
             <div className="setting-row">
-              <span className="setting-label">⏱️ Vote Timer</span>
-              <div className="number-control">
-                <button onClick={()=>actions.updateSettings({voteTimerSeconds:Math.max(0,settings.voteTimerSeconds-15)})}>−</button>
+              <span>⏱️ Vote Timer</span>
+              <div className="num-ctrl">
+                <button onClick={()=>upd({voteTimerSeconds:Math.max(0,settings.voteTimerSeconds-15)})}>−</button>
                 <span>{settings.voteTimerSeconds>0?`${settings.voteTimerSeconds}s`:'OFF'}</span>
-                <button onClick={()=>actions.updateSettings({voteTimerSeconds:settings.voteTimerSeconds+15})}>+</button>
+                <button onClick={()=>upd({voteTimerSeconds:settings.voteTimerSeconds+15})}>+</button>
               </div>
             </div>
 
             <div className="setting-row">
-              <span className="setting-label">🔒 Room Password</span>
-              <input className="password-input" type="text" placeholder="Optional"
-                value={settings.password||''} maxLength={12}
-                onChange={e=>actions.updateSettings({password:e.target.value})} />
+              <span>🔒 Password</span>
+              <input className="pass-input" placeholder="Optional" value={settings.password||''}
+                onChange={e=>upd({password:e.target.value})} maxLength={12}/>
             </div>
 
             <div className="roles-grid">
-              {ROLE_SETTINGS.map(r => (
-                <button key={r.key} className={`role-toggle ${settings[r.key]?'on':'off'}`} onClick={()=>toggle(r.key)}>
-                  <span className="rt-icon">{r.icon}</span>
-                  <span className="rt-label">{r.label}</span>
-                  <span className="rt-desc">{r.desc}</span>
-                  <span className={`rt-status ${settings[r.key]?'on':'off'}`}>{settings[r.key]?'ON':'OFF'}</span>
+              {ROLES.map(r => (
+                <button key={r.k} className={`role-tog ${settings[r.k]?'on':'off'}`} onClick={()=>tog(r.k)}>
+                  <span className="rt-i">{r.i}</span>
+                  <span className="rt-l">{r.l}</span>
+                  <span className="rt-d">{r.d}</span>
+                  <span className={`rt-s ${settings[r.k]?'on':'off'}`}>{settings[r.k]?'ON':'OFF'}</span>
                 </button>
               ))}
             </div>
           </div>
         ) : (
           <div className="waiting-box">
-            <div className="waiting-dots"><span/><span/><span/></div>
+            <div className="dots"><span/><span/><span/></div>
             <p>Waiting for host to start...</p>
           </div>
         )}
 
-        {state.error && <div className="error-msg" onClick={actions.clearError}>⚠️ {state.error}</div>}
+        {state.error && <div className="err-msg" onClick={actions.clearError}>⚠️ {state.error}</div>}
 
         {isHost && (
-          <button className={`btn btn-primary ${!canStart?'disabled':''}`} onClick={canStart?actions.startGame:undefined}>
+          <button className={`btn-primary ${!canStart?'disabled':''}`} onClick={canStart?actions.startGame:undefined}>
             Start Game ({players.length} players)
           </button>
         )}
       </div>
     </div>
-  );
+  )
 }
